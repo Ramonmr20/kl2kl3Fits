@@ -7,7 +7,7 @@ import bz2
 import sqlite3
 import sys
 # from lqcd_analysis import dataset
-from lqcd_analysis import analysis
+# from lqcd_analysis import analysis
 from lqcd_analysis import autocorrelation
 from lqcd_analysis import correlator
 
@@ -17,21 +17,30 @@ warnings.filterwarnings("error")
 
 LOGGER = logging.getLogger("fits")
 
-def main(kl2file,kl3file):
+def main(kl2file,kl3file,outkl2,outkl3):
+
+    # Connect with kl2 output db
+    outkl2_conn = create_connection(outkl2)
+    outkl2_cursor = outkl2_conn.cursor()
+
+    copy_correlation(kl2file,outkl2_conn)
+    exit()
 
     # Reading Kl2 data
-    fulldata = read_allcorr_sql(kl2file)
+    fulldata_kl2 = read_allcorr_sql(kl2file)
 
     # Compute autocorrelation MC time
-    autocorr(fulldata,kl2file)
+    autocorr(fulldata_kl2,kl2file)
 
     # Compute effective mass for the Kl2 correlators.
     # This can be used later as a quick check of the correlation 
     # between Kl2 and Kl3 corr. Indicating that they come indeed
     # from the same configurations.
-    meff_Kl2 = compute_meff(fulldata)
+    # meff_kl2 = compute_meff(fulldata)
 
+    avgdata_kl2 = gv.dataset.avg_data(fulldata_kl2,bstrap=False) # Check bstrap option
 
+    outkl2_conn.close()
 
 def compute_meff(data):
     """
@@ -131,8 +140,49 @@ def read_allcorr_sql(datafile):
 
     return data
 
+def copy_correlation(infile,outcursor):
+    """
+    Copies the correlator table from the infile to the outfile using its cursor.
+    Args:
+        infile: input file from which correlator table is copied.
+        outcursor: cursor to the connection to the output database.
+    """
+    
+    with sqlite3.connect(infile) as conn:
+        cursor = conn.cursor()
+
+        table = cursor.execute("SELECT * FROM correlator")
+
+        outcursor.execute("CREATE TABLE correlator( correlator_id integer PRIMARY KEY, correlator_hash text NOT NULL, momentum text NOT NULL, mass1 float NOT NULL, mass2 float NOT NULL, sinks text NOT NULL, source text NOT NULL, sinkops text NOT NULL, UNIQUE(momentum, mass1, mass2, sinks, source, sinkops, correlator_hash));")
+
+        for corr in table:
+            outcursor.execute("REPLACE INTO correlator (correlator_id, correlator_hash, momentum, mass1, mass2, sinks, source, sinkops) VALUES(:correlator_id, :correlator_hash, :momentum, :mass1, :mass2, :sinks, :source, :sinkops)",corr)
+
+
+
+
+def create_connection(file):
+    """
+    Creates a connection to a sqlite database
+    Args:
+        file: database file
+    Returns:
+        conn: connection to database
+    """
+
+    conn = None
+
+    try:
+        conn = sqlite3.connect(file)
+
+    except sqlite3.Error as e:
+        print(e)
+
+    return conn
+
+
 
 if __name__ == "__main__":
 
     # main("/home/ramon/PhD/Kpi/Fits2pt/data/fpi3264f211b600m00507m0507m628.sqlite","/home/ramon/PhD/Kpi/code/data/a012_Tests/Kl3_3264f211b600m00507m0507m628.dat")
-    main("/home/ramon/PhD/Kpi/Fits2pt/data/fpi_test.sqlite","/home/ramon/PhD/Kpi/code/data/a012_Tests/Kl3_3264f211b600m00507m0507m628.dat")
+    main("/home/ramon/PhD/Kpi/Fits2pt/data/fpi_test.sqlite","/home/ramon/PhD/Kpi/code/data/a012_Tests/Kl3_3264f211b600m00507m0507m628.dat","outkl2.sqlite","outkl3.sqlite")
