@@ -54,9 +54,78 @@ def main(kl2file,kl3file,outkl2,outkl3):
     meff_kl2 = compute_meff(fulldata_kl2)
 
     avgdata_kl2 = gv.dataset.avg_data(fulldata_kl2,bstrap=False) # Check bstrap option
+    central_kl2_fits(avgdata_kl2,outkl2_cursor)
 
     outkl2_conn.commit()
     outkl2_conn.close()
+
+def central_kl2_fits(data_avg,outcursor):
+
+    model, priors = build_kl2_model(data_avg,outcursor,len(data_avg["c2_1"]),10,len(data_avg["c2_1"])-2)
+
+    fitter = cf.CorrFitter(model)
+    print("Doing fit")
+    fit = fitter.lsqfit(data_avg,prior=priors,p0=None)
+    print(fit)
+    print(fit.chi2/fit.dof)
+
+    # Remove from this line on
+
+    
+
+
+def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
+
+    def update_corr_parameters(corr_id,a,ao,dE,dEo):
+        outcursor.execute("UPDATE correlator SET amplitude_key=:a, oamplitude_key=:ao, energy_key=:dE, oenergy_key=:dEo WHERE correlator_id=:correlator_id;",(a,ao,dE,dEo,corr_id))
+
+    outcursor.execute("ALTER TABLE correlator ADD COLUMN amplitude_key text;")
+    outcursor.execute("ALTER TABLE correlator ADD COLUMN oamplitude_key text;")
+    outcursor.execute("ALTER TABLE correlator ADD COLUMN energy_key text;")
+    outcursor.execute("ALTER TABLE correlator ADD COLUMN oenergy_key text;")
+
+    corr_info = list(outcursor.execute("SELECT correlator_id, mass1, mass2 from correlator"))
+    model = []
+    priors = {}
+
+    for ii in range(len(corr_info)):
+        cid = corr_info[ii][0]
+        mass1 = corr_info[ii][1]
+        mass2 = corr_info[ii][2]
+
+        corr_key = "c2_" + str(cid)
+        a_key = corr_key + ":a"
+        ao_key = corr_key + ":ao"
+
+        same_mass_corr_id = list(outcursor.execute("SELECT correlator_id FROM correlator WHERE (mass1=:mass1 AND mass2=:mass2 AND energy_key IS NOT NULL)",(mass1,mass2)))
+
+        if same_mass_corr_id:
+            dE_keys = list(outcursor.execute("SELECT energy_key, oenergy_key FROM correlator WHERE correlator_id=:correlator_id",same_mass_corr_id[0]))[0]
+
+            dE_key = dE_keys[0]
+            dEo_key = dE_keys[1]
+        else:
+            dE_key = corr_key + ":dE"
+            dEo_key = corr_key + ":dEo"
+
+            priors["log(" + dE_key + ")"] = [gv.log(gv.gvar('0.5(0.5)'))]*3
+            priors["log(" + dE_key + ")"][0] = gv.log(gv.gvar('1(1)'))
+
+            priors["log(" + dEo_key + ")"] = [gv.log(gv.gvar('0.5(0.5)'))]*3
+            priors["log(" + dEo_key + ")"][0] = gv.log(gv.gvar('1(1)'))
+
+
+        update_corr_parameters(cid,a_key,ao_key,dE_key,dEo_key)
+
+        model.append(cf.Corr2(datatag=corr_key,a=(a_key,ao_key),b=(a_key,ao_key),dE=(dE_key,dEo_key),tp=tp,tmin=tmin,tmax=tmax))
+        priors["log(" + a_key + ")"] = [gv.log(gv.gvar('0.1(1.0)'))]*3
+        priors["log(" + ao_key + ")"] = [gv.log(gv.gvar('0.1(1.0)'))]*3
+    
+
+    return model, priors
+    
+
+
 
 def compute_meff(data):
     """
