@@ -6,6 +6,7 @@ import logging
 import bz2
 import sqlite3
 import sys
+import os
 # from lqcd_analysis import dataset
 # from lqcd_analysis import analysis
 from lqcd_analysis import autocorrelation
@@ -17,29 +18,44 @@ warnings.filterwarnings("error")
 
 LOGGER = logging.getLogger("fits")
 
+INCLUSTER = True
+
 def main(kl2file,kl3file,outkl2,outkl3):
 
     # Connect with kl2 output db
+    
+    if os.path.exists(outkl2):
+        print("Output file",outkl2,"already exists.")
+        print("Remove and continue?")
+        if INCLUSTER:
+            os.remove(outkl2)
+            print("INCLUSTER detected, deleted...")
+        elif input("Y/N?: ")!="Y":
+            exit()
+        else:
+            os.remove(outkl2)
+            print("Deleted")
+
     outkl2_conn = create_connection(outkl2)
     outkl2_cursor = outkl2_conn.cursor()
 
     copy_correlation(kl2file,outkl2_conn)
-    exit()
 
     # Reading Kl2 data
     fulldata_kl2 = read_allcorr_sql(kl2file)
 
     # Compute autocorrelation MC time
-    autocorr(fulldata_kl2,kl2file)
+    autocorr(fulldata_kl2,outkl2_cursor)
 
     # Compute effective mass for the Kl2 correlators.
     # This can be used later as a quick check of the correlation 
     # between Kl2 and Kl3 corr. Indicating that they come indeed
     # from the same configurations.
-    # meff_kl2 = compute_meff(fulldata)
+    meff_kl2 = compute_meff(fulldata_kl2)
 
     avgdata_kl2 = gv.dataset.avg_data(fulldata_kl2,bstrap=False) # Check bstrap option
 
+    outkl2_conn.commit()
     outkl2_conn.close()
 
 def compute_meff(data):
@@ -77,40 +93,35 @@ def compute_meff(data):
     return meff
 
 
-def autocorr(data,datafile,REWRITE=False):
+def autocorr(data,outcursor,REWRITE=False):
     """
     Computes the autocorrelation time for the correlators and adds it in the database in a new column called tau in the correlator table. It does not do anything if they are already computed. It does not return anything.
     Args:
-        data:
-        datafile:
+        data: data from which tau is computed
+        datafile: database where tau is saved
     """
 
-    with sqlite3.connect(datafile) as conn:
-        cursor = conn.cursor()
+    corr_ids = list(outcursor.execute("SELECT correlator_id FROM correlator"))
+    columns = list(outcursor.execute("pragma table_info(correlator)"))
 
-        corr_ids = list(cursor.execute("SELECT correlator_id FROM correlator"))
-        columns = list(cursor.execute("pragma table_info(correlator)"))
+    
+    if REWRITE:
+        drop_tau = outcursor.execute("ALTER TABLE correlator DROP tau")
 
-        
-        if REWRITE:
-            drop_tau = cursor.execute("ALTER TABLE correlator DROP tau")
+    if not any([c[1]=="tau" for c in columns]):
+        add_tau_column = "ALTER TABLE correlator ADD tau float"
+        outcursor.execute(add_tau_column)
 
-        if not any([c[1]=="tau" for c in columns]):
-            print("enter")
-            add_tau_column = "ALTER TABLE correlator ADD tau float"
-            cursor.execute(add_tau_column)
+        fill_tau = "UPDATE correlator SET tau=:tau WHERE correlator_id=:correlator_id"
+        for cid in corr_ids:
+            corr_key = "c2_" + str(cid[0])
+            tau_arr = [] # tau for each time_slice
+            for t_slice in range(len(data[corr_key][0])):
+                data_slice = [d[t_slice] for d in data[corr_key]]
+                tau_arr.append(autocorrelation.compute_tau(data_slice))
+            tau = max(tau_arr) # We choose the most conservative estimate
+            outcursor.execute(fill_tau,(tau,cid[0]))
 
-            fill_tau = "UPDATE correlator SET tau=:tau WHERE correlator_id=:correlator_id"
-            for cid in corr_ids:
-                corr_key = "c2_" + str(cid[0])
-                tau_arr = [] # tau for each time_slice
-                for t_slice in range(len(data[corr_key][0])):
-                    data_slice = [d[t_slice] for d in data[corr_key]]
-                    tau_arr.append(autocorrelation.compute_tau(data_slice))
-                tau = max(tau_arr) # We choose the most conservative estimate
-                cursor.execute(fill_tau,(tau,cid[0]))
-
-            conn.commit()
          
     return 0
 
