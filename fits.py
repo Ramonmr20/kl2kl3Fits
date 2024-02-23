@@ -61,6 +61,8 @@ def main(kl2file,kl3file,outkl2,outkl3):
 
 def central_kl2_fits(data_avg,outcursor):
 
+
+
     model, priors = build_kl2_model(data_avg,outcursor,len(data_avg["c2_1"]),10,len(data_avg["c2_1"])-2)
 
     fitter = cf.CorrFitter(model)
@@ -75,6 +77,52 @@ def central_kl2_fits(data_avg,outcursor):
 
 
 def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
+    """
+    Builds model and priors for the 2pts kl2 fits.
+    Args:
+        data_avg: avg data for the central fit.
+        outcursor: cursor to the output database.
+        tp: temporal dimension of the lattice.
+        tmin: tmin used in the fits.
+        tmax: tmax used in the fits
+    Returns:
+        model: corrfitter model.
+        priors: prior dictionary
+        
+    """
+
+    def B0_estimation():
+        """
+        The idea is to quick estimate ChPT B0 to construct the central fit priors
+        B0 = Mij**2 / (mi + mj) where mi,j are valence quarks masses
+        """
+
+        corr_info = outcursor.execute("SELECT correlator_id, mass1, mass2 FROM correlator")
+        corr = corr_info.fetchone()
+        key= "c2_" + str(corr[0])
+        mass1 = corr[1]
+        mass2 = corr[2]
+
+        data_slice = {key: data_avg[key]}
+
+        model = [
+                cf.Corr2(datatag=key,a=("a","ao"),b=("a","ao"),dE=("dE","dEo"),tp=tp,tmin=tmin,tmax=tmax),
+                ]
+
+        priors = {}
+
+        priors["log(a)"] = [gv.log(gv.gvar("0.1(1.0)"))]*3
+        priors["log(ao)"] =[gv.log(gv.gvar("0.1(1.0)"))]*3
+        
+        priors["log(dE)"] =[gv.log(gv.gvar("0.3(3)")),gv.gvar("0.5(5)"),gv.gvar("0.5(5)")]
+        priors["log(dEo)"] =[gv.log(gv.gvar("0.3(3)")),gv.gvar("0.5(5)"),gv.gvar("0.5(5)")]
+
+        fit = fitter.lsqfit(data_slice,prior=priors,p0=None)
+        if fit.chi2/fit.dof > 1:
+            print("Quick fit not good enough")
+
+        return fit.pmean["dE"]**2/(mass1+mass2)
+
 
     def update_corr_parameters(corr_id,a,ao,dE,dEo):
         outcursor.execute("UPDATE correlator SET amplitude_key=:a, oamplitude_key=:ao, energy_key=:dE, oenergy_key=:dEo WHERE correlator_id=:correlator_id;",(a,ao,dE,dEo,corr_id))
@@ -87,6 +135,8 @@ def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
     corr_info = list(outcursor.execute("SELECT correlator_id, mass1, mass2 from correlator"))
     model = []
     priors = {}
+
+    B0 = B0_estimation()
 
     for ii in range(len(corr_info)):
         cid = corr_info[ii][0]
@@ -108,11 +158,13 @@ def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
             dE_key = corr_key + ":dE"
             dEo_key = corr_key + ":dEo"
 
-            priors["log(" + dE_key + ")"] = [gv.log(gv.gvar('0.5(0.5)'))]*3
-            priors["log(" + dE_key + ")"][0] = gv.log(gv.gvar('1(1)'))
+            prior_guess = gv.gvar(B0*(mass1 + mass2),B0*(mass1 + mass2)*0.1)
 
-            priors["log(" + dEo_key + ")"] = [gv.log(gv.gvar('0.5(0.5)'))]*3
-            priors["log(" + dEo_key + ")"][0] = gv.log(gv.gvar('1(1)'))
+            priors["log(" + dE_key + ")"] = [gv.log(prior_guess + gv.gvar("0.2(0.2)"))]*3
+            priors["log(" + dE_key + ")"][0] = gv.log(prior_guess)
+
+            priors["log(" + dEo_key + ")"] = [gv.log(prior_guess + gv.gvar("0.2(0.2)"))]*3
+            priors["log(" + dEo_key + ")"][0] = gv.log(prior_guess)
 
 
         update_corr_parameters(cid,a_key,ao_key,dE_key,dEo_key)
