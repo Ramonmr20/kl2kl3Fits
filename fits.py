@@ -7,14 +7,15 @@ import bz2
 import sqlite3
 import sys
 import os
+import shrink
 # from lqcd_analysis import dataset
 # from lqcd_analysis import analysis
 from lqcd_analysis import autocorrelation
 from lqcd_analysis import correlator
 
 import matplotlib.pyplot as plt
-import warnings
-warnings.filterwarnings("error")
+# import warnings
+# warnings.filterwarnings("error")
 
 LOGGER = logging.getLogger("fits")
 
@@ -52,29 +53,29 @@ def main(kl2file,kl3file,outkl2,outkl3):
     # between Kl2 and Kl3 corr. Indicating that they come indeed
     # from the same configurations.
     meff_kl2 = compute_meff(fulldata_kl2)
+    
 
+    dddd = shrinkNbin(fulldata_kl2,outkl2_cursor)
+    exit()
+
+    #Central fit
     avgdata_kl2 = gv.dataset.avg_data(fulldata_kl2,bstrap=False) # Check bstrap option
-    central_kl2_fits(avgdata_kl2,outkl2_cursor)
+    central_kl2_fit(avgdata_kl2,outkl2_cursor)
 
     outkl2_conn.commit()
     outkl2_conn.close()
 
-def central_kl2_fits(data_avg,outcursor):
-
-
+def central_kl2_fit(data_avg,outcursor):
 
     model, priors = build_kl2_model(data_avg,outcursor,len(data_avg["c2_1"]),10,len(data_avg["c2_1"])-2)
 
     fitter = cf.CorrFitter(model)
-    print("Doing fit")
+    print("Doing central fit")
     fit = fitter.lsqfit(data_avg,prior=priors,p0=None)
     print(fit)
     print(fit.chi2/fit.dof)
 
     # Remove from this line on
-
-    
-
 
 def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
     """
@@ -117,11 +118,12 @@ def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
         priors["log(dE)"] =[gv.log(gv.gvar("0.3(3)")),gv.gvar("0.5(5)"),gv.gvar("0.5(5)")]
         priors["log(dEo)"] =[gv.log(gv.gvar("0.3(3)")),gv.gvar("0.5(5)"),gv.gvar("0.5(5)")]
 
+        fitter = cf.CorrFitter(model)
         fit = fitter.lsqfit(data_slice,prior=priors,p0=None)
         if fit.chi2/fit.dof > 1:
             print("Quick fit not good enough")
 
-        return fit.pmean["dE"]**2/(mass1+mass2)
+        return fit.pmean["dE"][0]**2/(mass1+mass2)
 
 
     def update_corr_parameters(corr_id,a,ao,dE,dEo):
@@ -177,6 +179,52 @@ def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
     return model, priors
     
 
+def shrinkNbin(data,outcursor):
+    """
+    Bins and shrinks data.
+    Args:
+        data: full dataset.
+        outcursor: db where tau is stored.
+    Returns:
+        data_bin: shrinked and binned data.
+    """
+
+    def shrinked_corr(data):
+        mcorr = gv.evalcorr(data)
+        mcorr_stacked = np.vstack([np.hstack([mcorr[(key1,key2)] for key2 in list(mcorr)]) for key1 in keylist])
+        vals, vecs = np.linalg.eig(mcorr_stacked)
+
+        order = np.argsort(vals)
+        vals = vals[order]
+        vecs = vecs[:, order]
+
+        vals_shrink = shrink.direct_nl_shrink(vals, n_eff)
+        # Reconstruct eigenvalue matrix: vecs x diag(vals) x vecs^T
+        corr_shrink = np.matmul(
+                        vecs,
+                        np.matmul(
+                            np.diag(vals_shrink),
+                            vecs.transpose())
+                        )
+
+        return corr_shrink
+        
+
+    corr_info = outcursor.execute("SELECT correlator_id, tau FROM correlator")
+
+    data_bin = {}
+    for corr in corr_info:
+        cid = corr[0]
+        corr_key = "c2_" + str(cid)
+        tau = corr[1]
+
+        data_bin[corr_key] = gv.dataset.bin_data(data[corr_key],binsize=int(np.ceil(tau)))
+
+    data_bin = gv.dataset.avg_data(data_bin)
+    # Nonlinear Shrinkage
+    data_bin = gv.correlate(data_bin,shrinked_corr(data_bin))
+
+    return data_bin
 
 
 def compute_meff(data):
