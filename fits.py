@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 LOGGER = logging.getLogger("fits")
 
 INCLUSTER = True
+DEBUG = True
 
 def main(kl2file,kl3file,outkl2,outkl3):
 
@@ -45,6 +46,14 @@ def main(kl2file,kl3file,outkl2,outkl3):
     # Reading Kl2 data
     fulldata_kl2 = read_allcorr_sql(kl2file)
 
+    if DEBUG:
+        slice_data = gv.dataset.Dataset()
+        slice_keys = list(fulldata_kl2)
+        for key in slice_keys:
+            slice_data[key] = fulldata_kl2[key]
+
+        fulldata_kl2 = slice_data
+
     # Compute autocorrelation MC time
     autocorr(fulldata_kl2,outkl2_cursor)
 
@@ -54,16 +63,62 @@ def main(kl2file,kl3file,outkl2,outkl3):
     # from the same configurations.
     meff_kl2 = compute_meff(fulldata_kl2)
     
+    # Bin and shrink data
+    # data_kl2 = shrinkNbin(fulldata_kl2,outkl2_cursor)
 
-    dddd = shrinkNbin(fulldata_kl2,outkl2_cursor)
-    exit()
-
+    model, priors = build_kl2_model_2corr(101,102,outkl2_cursor)
+    print(priors)
     #Central fit
-    avgdata_kl2 = gv.dataset.avg_data(fulldata_kl2,bstrap=False) # Check bstrap option
-    central_kl2_fit(avgdata_kl2,outkl2_cursor)
+    # avgdata_kl2 = gv.dataset.avg_data(fulldata_kl2,bstrap=False) # Check bstrap option
+    # central_kl2_fit(avgdata_kl2,outkl2_cursor)
 
     outkl2_conn.commit()
     outkl2_conn.close()
+
+def build_kl2_model_2corr(corrid1,corrid2,outcursor,B0=1.8,tp=64,tmin=10,tmax=62):
+    """
+    Builds model for 2 2pts correlators and their priors. It assumes both correlators have the same masses.
+    Args:
+        corridi: id of the ith correlator.
+        outcursor: cursor to the output db.
+        tp: temporal dimension of the lattice.
+        tmin: tmin used in the fit.
+        tmax: tmax used in the fit.
+    Returns:
+        model: corrfitter model.
+        priors: dictionary with the priors.
+
+    """
+
+    def sum_werr(a,b,w=1):
+        """
+        Sums two gvars and sets the error equal to the mean value*weight.
+        """
+        gvsum = gv.mean(a+b)
+        return gv.gvar(gvsum,gvsum*w)
+
+    datatag1 = "c2_" + str(corrid1)
+    datatag2 = "c2_" + str(corrid2)
+
+    model = [
+            cf.Corr2(datatag=datatag1,a=("a1","ao1"),b=("a1","ao1"),dE=("dE","dEo"),tp=tp,tmin=tmin,tmax=tmax),
+            cf.Corr2(datatag=datatag2,a=("a2","ao2"),b=("a2","ao2"),dE=("dE","dEo"),tp=tp,tmin=tmin,tmax=tmax)
+            ]
+
+    masses = list(outcursor.execute("SELECT mass1, mass2 FROM correlator WHERE correlator_id=:correlator_id",(corrid1,)))[0]
+    mass_guess = np.sqrt(B0*(masses[0] + masses[1]))
+
+    priors = gv.BufferDict()
+
+    priors["log(a1)"] = [gv.log(gv.gvar("0.1(1.0)"))]*3
+    priors["log(ao1)"] = [gv.log(gv.gvar("0.1(1.0)"))]*3
+    priors["log(a2)"] = [gv.log(gv.gvar("0.1(1.0)"))]*3
+    priors["log(ao2)"] = [gv.log(gv.gvar("0.1(1.0)"))]*3
+
+    priors["log(dE)"] = [gv.log(sum_werr(gv.gvar(mass_guess,mass_guess),0.2))]*3
+    priors["log(dE)"][0] = gv.log(gv.gvar(mass_guess,mass_guess*0.1))
+
+    return model, priors
 
 def central_kl2_fit(data_avg,outcursor):
 
@@ -72,10 +127,35 @@ def central_kl2_fit(data_avg,outcursor):
     fitter = cf.CorrFitter(model)
     print("Doing central fit")
     fit = fitter.lsqfit(data_avg,prior=priors,p0=None)
-    print(fit)
-    print(fit.chi2/fit.dof)
+    # print(fit)
+    # print(fit.chi2/fit.dof)
 
-    # Remove from this line on
+    create_table = "CREATE TABLE centralfit (correlator_id int, energy float, amp, float, chi2_per_dof float, energy_prior float, amp_prior float);"
+
+
+    write_results_2pt = """
+    INSERT INTO centralfit
+    (
+        correlator_id, energy, amp, chi2_per_dof, energy_prior, amp_prior
+    )
+    VALUES
+    (
+        :correlator_id, :energy, :amp, :chi2_per_dof, :energy_prior, :amp_prior
+    )
+    ON CONFLICT
+    (
+        correlator_id
+    )
+    DO UPDATE SET
+    (
+        energy, amp, chi2_per_dof, energy_prior, amp_prior
+    )=
+    (
+        :energy, :amp, :chi2_per_dof, :energy_prior, :amp_prior
+    );
+    """
+
+    outcursor.execute(create_table)
 
 def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
     """
@@ -129,12 +209,20 @@ def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
     def update_corr_parameters(corr_id,a,ao,dE,dEo):
         outcursor.execute("UPDATE correlator SET amplitude_key=:a, oamplitude_key=:ao, energy_key=:dE, oenergy_key=:dEo WHERE correlator_id=:correlator_id;",(a,ao,dE,dEo,corr_id))
 
+    def sum_werr(a,b,w=1):
+        """
+        Sums two gvars and sets the error equal to the mean value*weight.
+        """
+        gvsum = gv.mean(a+b)
+        return gv.gvar(gvsum,gvsum*w)
+
+
     outcursor.execute("ALTER TABLE correlator ADD COLUMN amplitude_key text;")
     outcursor.execute("ALTER TABLE correlator ADD COLUMN oamplitude_key text;")
     outcursor.execute("ALTER TABLE correlator ADD COLUMN energy_key text;")
     outcursor.execute("ALTER TABLE correlator ADD COLUMN oenergy_key text;")
 
-    corr_info = list(outcursor.execute("SELECT correlator_id, mass1, mass2 from correlator"))
+    corr_info = list(outcursor.execute("SELECT correlator_id, mass1, mass2 FROM correlator"))
     model = []
     priors = {}
 
@@ -160,13 +248,14 @@ def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
             dE_key = corr_key + ":dE"
             dEo_key = corr_key + ":dEo"
 
-            prior_guess = gv.gvar(B0*(mass1 + mass2),B0*(mass1 + mass2)*0.1)
+            prior_guess = np.sqrt(B0*(mass1 + mass2))
+            prior_guess = gv.gvar(prior_guess,prior_guess)
 
-            priors["log(" + dE_key + ")"] = [gv.log(prior_guess + gv.gvar("0.2(0.2)"))]*3
+            priors["log(" + dE_key + ")"] = [gv.log(sum_werr(prior_guess,0.2))]*3
             priors["log(" + dE_key + ")"][0] = gv.log(prior_guess)
 
-            priors["log(" + dEo_key + ")"] = [gv.log(prior_guess + gv.gvar("0.2(0.2)"))]*3
-            priors["log(" + dEo_key + ")"][0] = gv.log(prior_guess)
+            priors["log(" + dEo_key + ")"] = [gv.log(sum_werr(prior_guess,0.3))]*3
+            priors["log(" + dEo_key + ")"][0] = gv.log(sum_werr(prior_guess,0.1))
 
 
         update_corr_parameters(cid,a_key,ao_key,dE_key,dEo_key)
@@ -175,6 +264,7 @@ def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
         priors["log(" + a_key + ")"] = [gv.log(gv.gvar('0.1(1.0)'))]*3
         priors["log(" + ao_key + ")"] = [gv.log(gv.gvar('0.1(1.0)'))]*3
     
+    print(gv.exp(priors["log(c2_2:dE)"]))
 
     return model, priors
     
