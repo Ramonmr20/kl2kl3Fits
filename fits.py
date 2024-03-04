@@ -48,7 +48,7 @@ def main(kl2file,kl3file,outkl2,outkl3):
 
     if DEBUG:
         slice_data = gv.dataset.Dataset()
-        slice_keys = list(fulldata_kl2)
+        slice_keys = list(fulldata_kl2)[:4]
         for key in slice_keys:
             slice_data[key] = fulldata_kl2[key]
 
@@ -64,16 +64,65 @@ def main(kl2file,kl3file,outkl2,outkl3):
     meff_kl2 = compute_meff(fulldata_kl2)
     
     # Bin and shrink data
-    # data_kl2 = shrinkNbin(fulldata_kl2,outkl2_cursor)
+    data_kl2 = shrinkNbin(fulldata_kl2,outkl2_cursor)
 
-    model, priors = build_kl2_model_2corr(101,102,outkl2_cursor)
-    print(priors)
-    #Central fit
-    # avgdata_kl2 = gv.dataset.avg_data(fulldata_kl2,bstrap=False) # Check bstrap option
-    # central_kl2_fit(avgdata_kl2,outkl2_cursor)
+    run_kl2_fits(data_kl2,outkl2_cursor)
 
     outkl2_conn.commit()
     outkl2_conn.close()
+
+def run_kl2_fits(data,outcursor):
+    """
+    Run kl2 fits, fitting together every two corr.
+    Args: 
+        data: data for the 2 pt corr functions.
+        outcursor: cursor to the  out db where the 2pt corr in and out info is stored.
+    Returns:
+        Nothing, but saves results in the out db.
+    """
+
+    create_table = "CREATE TABLE centralfit (correlator_id int, energy string, amp, string, chi2_per_dof float, energy_prior string, amp_prior string);"
+
+    write_results_2pt = """
+    INSERT INTO centralfit
+    (
+        correlator_id, energy, amp, chi2_per_dof, energy_prior, amp_prior
+    )
+    VALUES
+    (
+        :correlator_id, :energy, :amp, :chi2_per_dof, :energy_prior, :amp_prior
+    );"""
+    # ON CONFLICT
+    # (
+    #     correlator_id
+    # )
+    # DO UPDATE SET
+    # (
+    #     energy, amp, chi2_per_dof, energy_prior, amp_prior
+    # )=
+    # (
+    #     :energy, :amp, :chi2_per_dof, :energy_prior, :amp_prior
+    # );
+    # """
+
+    outcursor.execute(create_table)
+    corr_id = list(outcursor.execute("SELECT correlator_id FROM correlator"))
+
+    for c in corr_id:
+        corr_key = "c2_" + str(c[0])
+        if corr_key not in list(data): # Not in data
+            continue
+        if c[0]%2==0: # Even corr are considered along with odd ones
+            continue
+
+        model, priors = build_kl2_model_2corr(c[0],c[0]+1,outcursor)
+        fitter = cf.CorrFitter(model)
+        fit = fitter.lsqfit(data,prior=priors)
+        outcursor.execute(write_results_2pt,(c[0],str(fit.p["dE"][0]),str(fit.p["a1"][0]),fit.chi2/fit.dof,str(priors["dE"][0]),str(priors["a1"][0])))
+        # outcursor.execute(write_results_2pt,(c[0]+1,str(fit.p["dE"][0]),str(fit.p["a2"][0]),fit.chi2/fit.dof,priors["dE"][0],priors["a2"][0]))
+        
+
+    
 
 def build_kl2_model_2corr(corrid1,corrid2,outcursor,B0=1.8,tp=64,tmin=10,tmax=62):
     """
@@ -117,49 +166,16 @@ def build_kl2_model_2corr(corrid1,corrid2,outcursor,B0=1.8,tp=64,tmin=10,tmax=62
 
     priors["log(dE)"] = [gv.log(sum_werr(gv.gvar(mass_guess,mass_guess),0.2))]*3
     priors["log(dE)"][0] = gv.log(gv.gvar(mass_guess,mass_guess*0.1))
+    priors["log(dEo)"] = [gv.log(sum_werr(gv.gvar(mass_guess,mass_guess),0.3))]*3
+    priors["log(dEo)"][0] = gv.log(sum_werr(gv.gvar(mass_guess,mass_guess),0.1))
 
     return model, priors
 
-def central_kl2_fit(data_avg,outcursor):
 
-    model, priors = build_kl2_model(data_avg,outcursor,len(data_avg["c2_1"]),10,len(data_avg["c2_1"])-2)
-
-    fitter = cf.CorrFitter(model)
-    print("Doing central fit")
-    fit = fitter.lsqfit(data_avg,prior=priors,p0=None)
-    # print(fit)
-    # print(fit.chi2/fit.dof)
-
-    create_table = "CREATE TABLE centralfit (correlator_id int, energy float, amp, float, chi2_per_dof float, energy_prior float, amp_prior float);"
-
-
-    write_results_2pt = """
-    INSERT INTO centralfit
-    (
-        correlator_id, energy, amp, chi2_per_dof, energy_prior, amp_prior
-    )
-    VALUES
-    (
-        :correlator_id, :energy, :amp, :chi2_per_dof, :energy_prior, :amp_prior
-    )
-    ON CONFLICT
-    (
-        correlator_id
-    )
-    DO UPDATE SET
-    (
-        energy, amp, chi2_per_dof, energy_prior, amp_prior
-    )=
-    (
-        :energy, :amp, :chi2_per_dof, :energy_prior, :amp_prior
-    );
-    """
-
-    outcursor.execute(create_table)
 
 def build_kl2_model(data_avg,outcursor,tp,tmin,tmax):
     """
-    Builds model and priors for the 2pts kl2 fits.
+    Builds model and priors for the whole set of 2pts kl2 fits.
     Args:
         data_avg: avg data for the central fit.
         outcursor: cursor to the output database.
@@ -279,9 +295,25 @@ def shrinkNbin(data,outcursor):
         data_bin: shrinked and binned data.
     """
 
-    def shrinked_corr(data):
+    def unstack_matrix(matrix,dic):
+    
+        ust_matrix = gv.BufferDict()
+        keylist = list(dic)
+    
+        rows = np.split(matrix,np.cumsum([len(dic[key]) for key in list(dic)]),axis=0)
+        rows = rows[:-1]
+    
+        for ii in range(len(rows)):
+            col = np.split(rows[ii],np.cumsum([len(dic[key]) for key in list(dic)]),axis=1)
+            for jj in range(len(rows)):
+                ust_matrix[(keylist[ii],keylist[jj])] = col[jj]
+    
+        return ust_matrix
+
+    def shrinked_corr(data,n_eff):
+        keylist = list(data)
         mcorr = gv.evalcorr(data)
-        mcorr_stacked = np.vstack([np.hstack([mcorr[(key1,key2)] for key2 in list(mcorr)]) for key1 in keylist])
+        mcorr_stacked = np.vstack([np.hstack([mcorr[(key1,key2)] for key2 in keylist]) for key1 in keylist])
         vals, vecs = np.linalg.eig(mcorr_stacked)
 
         order = np.argsort(vals)
@@ -297,22 +329,26 @@ def shrinkNbin(data,outcursor):
                             vecs.transpose())
                         )
 
-        return corr_shrink
+        return unstack_matrix(corr_shrink,data)
         
 
     corr_info = outcursor.execute("SELECT correlator_id, tau FROM correlator")
+    n_eff = len(data[list(data)[0]])
 
     data_bin = {}
     for corr in corr_info:
         cid = corr[0]
         corr_key = "c2_" + str(cid)
+        if corr_key not in list(data):
+            continue
         tau = corr[1]
 
         data_bin[corr_key] = gv.dataset.bin_data(data[corr_key],binsize=int(np.ceil(tau)))
 
     data_bin = gv.dataset.avg_data(data_bin)
     # Nonlinear Shrinkage
-    data_bin = gv.correlate(data_bin,shrinked_corr(data_bin))
+
+    data_bin = gv.correlate(data_bin,shrinked_corr(data_bin,n_eff))
 
     return data_bin
 
@@ -374,6 +410,8 @@ def autocorr(data,outcursor,REWRITE=False):
         fill_tau = "UPDATE correlator SET tau=:tau WHERE correlator_id=:correlator_id"
         for cid in corr_ids:
             corr_key = "c2_" + str(cid[0])
+            if corr_key not in list(data):
+                continue
             tau_arr = [] # tau for each time_slice
             for t_slice in range(len(data[corr_key][0])):
                 data_slice = [d[t_slice] for d in data[corr_key]]
