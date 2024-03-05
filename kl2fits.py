@@ -9,6 +9,7 @@ import sys
 import os
 import shrink
 import pickle
+import importlib
 # from lqcd_analysis import dataset
 # from lqcd_analysis import analysis
 from lqcd_analysis import autocorrelation
@@ -20,19 +21,22 @@ LOGGER = logging.getLogger("fits")
 
 INCLUSTER = True
 DEBUG = True
+WITHSHOULDDELETE = True
 RNGSEED = 50324
 
-def main(kl2file,kl3file,outdir):
+def main(kl2file,kl3file,kl3parfile,outdir):
 
     # Connect with kl2 output db
     if outdir[:-1]!="/":
         outdir = outdir + "/"
 
     outkl2 = outdir + "outkl2.sqlite"
-    outkl3 = outdir + "outkl3.sqlite"
+    # outkl3 = outdir + "outkl3.sqlite"
     cov_modkl2 = outdir + "cov_modkl2.pk"
     centralfits = outdir + "centralfits.log"
-    bfits = outdir + "bfits.log"
+    bfitskl2 = outdir + "bfitskl2.log"
+    bfitskl3 = outdir + "bfitskl3.log"
+    bkeyfile = outdir + "bkeys.txt"
     
     if os.path.exists(outkl2):
         print("Output file",outkl2,"already exists.")
@@ -53,6 +57,9 @@ def main(kl2file,kl3file,outdir):
 
     # Reading Kl2 data
     fulldata_kl2 = read_allcorr_sql(kl2file)
+    if WITHSHOULDDELETE:
+        for key in list(fulldata_kl2):
+            fulldata_kl2[key] = fulldata_kl2[key][:993]
 
     if DEBUG:
         slice_data = gv.dataset.Dataset()
@@ -79,13 +86,75 @@ def main(kl2file,kl3file,outdir):
     rng = np.random.default_rng(RNGSEED)
 
     n_conf = len(fulldata_kl2[list(fulldata_kl2)[0]])
-    gen_bootstrap_key(rng,n_conf,outfile=outdir+"bkeys.txt")
-    bootstrap_fits(fulldata_kl2,cov_modkl2,outkl2_cursor,bfits,bkeyfile=outdir+"bkeys.txt")
+    gen_bootstrap_key(rng,n_conf,outfile=bkeyfile)
+    bootstrap_fits_kl2(fulldata_kl2,cov_modkl2,outkl2_cursor,bfitskl2,bkeyfile=bkeyfile)
+
+    bootstrap_fits_kl3(kl3file,kl3parfile,outkl2_cursor,bfitskl3,bkeyfile)
 
     outkl2_conn.commit()
     outkl2_conn.close()
 
-def bootstrap_fits(data,cov_modkl2,outcursor,bfits,bkeyfile="bkeys.txt",tp=64,tmin=10,tmax=62):
+def bootstrap_fits_kl3(datafile,parfile,outcursor,bfits,bkeyfile):
+
+
+    create_table = "CREATE TABLE bfitskl3 (bootstrap_id int, energyKaon string, energyPion0 string, energyPion string, V00 string, chi2_per_dof float);"
+
+    write_results = """
+    INSERT INTO bfitskl3
+    (
+        bootstrap_id, energyKaon, energyPion0, energyPion, V00, chi2_per_dof
+    )
+    VALUES
+    (
+        :bootstrap_id, :energyKaon, :energyPion0, :energyPion, :V00, :chi2_per_dof
+    );"""
+
+    outcursor.execute(create_table)
+
+    data = gv.dataset.Dataset(datafile)
+    data_avg = gv.dataset.avg_data(data)
+
+    parfile = parfile.replace("/",".")
+    if parfile[-3:]==".py":
+        parfile = parfile[:-3]
+
+    pf = importlib.import_module(parfile,package=None)
+    fitter = cf.CorrFitter(pf.m23pt(pf.Nt,tmin=pf.t_min,tmax=pf.t_max))
+    
+    with open(pf.cov_mod_file,"rb") as f:
+        cov_mod = pickle.load(f)
+        priors = pickle.load(f)
+
+    f_bfits = open(bfits,"w")
+    with open(bkeyfile,"r") as f:
+
+        bcounter = 0
+        for bkey in f:
+            bsample = gv.dataset.Dataset()
+            for tag in list(data):
+                bsample[tag] = [data[tag][int(ii)] for ii in bkey.split()]
+
+            bsample = gv.dataset.avg_data(bsample)
+            bsample = gv.gvar(gv.mean(bsample),cov_mod)
+
+            fit = fitter.lsqfit(bsample,prior=priors)
+
+            f_bfits.write("~"*20+"\n")
+            f_bfits.write("Bootstrap number: " + str(bcounter) + "\n")
+            f_bfits.write("~"*20+"\n")
+            f_bfits.write(str(fit) + "\n")
+
+            outcursor.execute(write_results,(bcounter,str(fit.p["K0:dE"][0]),str(fit.p["pi0:dE"][0]),str(fit.p["pi:dE"][0]),str(fit.p["Vnn"][0,0]),fit.chi2/fit.dof))
+
+            bcounter += 1
+            if bcounter==2:
+                break
+            
+
+    f_bfits.close()
+
+
+def bootstrap_fits_kl2(data,cov_modkl2,outcursor,bfits,bkeyfile="bkeys.txt",tp=64,tmin=10,tmax=62):
     """
     Perform bootstrap fits using the cov matrix and priors extracted from the central fit.
     Args:
@@ -104,10 +173,10 @@ def bootstrap_fits(data,cov_modkl2,outcursor,bfits,bkeyfile="bkeys.txt",tp=64,tm
         bfits.
     """
 
-    create_table = "CREATE TABLE bfits (bootstrap_id int, correlator_id int, energy string, amp, string, chi2_per_dof float, energy_prior string, amp_prior string);"
+    create_table = "CREATE TABLE bfitskl2 (bootstrap_id int, correlator_id int, energy string, amp, string, chi2_per_dof float, energy_prior string, amp_prior string);"
 
     write_results_2pt = """
-    INSERT INTO bfits
+    INSERT INTO bfitskl2
     (
         bootstrap_id, correlator_id, energy, amp, chi2_per_dof, energy_prior, amp_prior
     )
@@ -469,5 +538,5 @@ def create_connection(file):
 
 if __name__ == "__main__":
 
-    main("/home/ramon/PhD/Kpi/Fits2pt/data/fpi_test.sqlite","/home/ramon/PhD/Kpi/code/data/a012_Tests/Kl3_3264f211b600m00507m0507m628.dat","tests")
+    main("/home/ramon/PhD/Kpi/Fits2pt/data/fpi_test.sqlite","/home/ramon/PhD/Kpi/code/data/a012_Tests/Kl3_3264f211b600m00507m0507m628.dat","tests/par3264.py","tests")
 
